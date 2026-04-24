@@ -11,9 +11,9 @@
 
 ## Overview
 
-Standard neural network pruning is a **two-step process**: train first, prune later. This project collapses both into one by giving each weight its own learnable **gate** — a scalar in (0, 1) that multiplies the weight's output. A custom **L1 sparsity loss** then pushes unnecessary gates toward exactly zero during backpropagation, effectively pruning those connections on the fly.
-
-The result is a sparse network that automatically discovers which connections matter — without any manual intervention after training.
+Standard pruning is a two-stage process: train a network, then remove unimportant weights after the fact. This project collapses both stages into one. Every weight in the network is paired with a learnable scalar gate. During training, an L1 penalty on these gates pushes unneeded ones to exactly zero, effectively removing those weights from the network in real time.
+ 
+The result is a single training run that simultaneously optimizes for classification accuracy and architectural sparsity, with the trade-off controlled by one hyperparameter, lambda.
 
 ---
 
@@ -40,36 +40,43 @@ The result is a sparse network that automatically discovers which connections ma
 
 ---
 
-## ⚙️ How It Works
+## How It Works
 
-### 1. The `PrunableLinear` Layer
-
-Every weight `w_ij` is paired with a learnable scalar `gate_score_ij`. During the forward pass:
-
+### Gated Linear Layer
+ 
+The core building block is `PrunableLinear`, a drop-in replacement for `nn.Linear`.
+ 
 ```
-gates         = sigmoid(gate_scores)       # squash to (0, 1)
-pruned_weights = weight ⊙ gates            # element-wise mask
-output         = input @ pruned_weights.T + bias
+gates          = clamp(gate_scores, 0, 1)
+pruned_weights = weight * gates
+output         = pruned_weights @ x.T + bias
 ```
-
-When a gate collapses to ≈ 0, its weight contributes nothing — it is effectively removed. Because the whole operation is differentiable, gradients flow through both `weight` and `gate_scores` automatically.
-
-### 2. Sparsity Loss
-
+ 
+Each `gate_score` is a learnable parameter of the same shape as the weight matrix.
+Clamping to [0, 1] keeps gates interpretable and avoids the vanishing gradient
+problem that arises with sigmoid in the flat tails.
+ 
+### Loss Function
+ 
 ```
-Total Loss = CrossEntropyLoss(ŷ, y)  +  λ · Σ sigmoid(gate_scores_ij)
+Total Loss = CrossEntropyLoss(y_hat, y)  +  lambda * SparsityLoss
+ 
+SparsityLoss = (1 / N_gates) * sum of all gate values
 ```
-
-The L1 penalty on gate values penalises the total active capacity of the network. The L1 norm is non-smooth at zero, which — just like in Lasso regression — produces **exact zeros** rather than merely small values.
-
-### 3. The λ Trade-off
-
-| λ | Effect |
-|---|--------|
-| Low  (`1e-5`) | Minimal pruning, high accuracy |
-| Medium (`1e-4`) | Balanced sparsity and accuracy |
-| High (`1e-3`) | Aggressive pruning, possible accuracy drop |
-
+ 
+Dividing by the total gate count normalizes the sparsity term to [0, 1] regardless
+of network size. This makes lambda directly interpretable: a value of 1.0 means the
+optimizer treats closing one unit of gate capacity as equivalent to reducing
+cross-entropy by 1.0.
+ 
+### Why L1 Encourages Exact Zeros
+ 
+The L1 sub-gradient is a constant +1 or -1 regardless of the current value.
+This means the pull toward zero never weakens, unlike L2 regularization whose
+gradient shrinks proportionally to the weight magnitude. L2 produces small values;
+L1 produces exact zeros. This is the same geometric reason LASSO regression produces
+sparse solutions while Ridge regression does not.
+ 
 ---
 
 ## Quick Start
@@ -104,15 +111,57 @@ python self_pruning_nn.py
 
 ---
 
-## Sample Results
+## Architecture
+
+```
+Input (3×32×32)
+      │  flatten
+      ▼
+PrunableLinear(3072 → 512) -> BatchNorm1d -> ReLU -> Dropout(0.2)
+      ▼
+PrunableLinear(512 → 256) -> BatchNorm1d -> ReLU -> Dropout(0.2)
+      ▼
+PrunableLinear(256 → 128)  -> BatchNorm1d -> ReLU -> Dropout(0.2)
+      ▼
+PrunableLinear(128 → 10)
+      ▼
+Output (10 classes)
+```
+Total learnable gates: 1,737,984
+---
+
+## Configuration
+
+All key hyperparameters are set as constants near the top of `self_pruning_nn.py`:
+
+| Setting | Value |
+|---------|-------|
+| Dataset | CIFAR-10 |
+| Optimizer | Adam |
+| Weight learning rate | 0.001 |
+| Gate learning rate | 0.1 (separate param group) |
+| Weight decay | 1e-4 (weights only, not gates) |
+| LR schedule | Cosine annealing |
+| Batch size | 128 |
+| Epochs | 40 |
+| Gate warmup | First 5 epochs (gates frozen) |
+| Gradient clipping | max norm = 5.0 |
+ 
+Gates use a 100x higher learning rate than weights. This allows gate_scores to
+respond quickly to sparsity pressure without destabilizing weight optimization.
+The 5-epoch warmup lets the network first learn a useful classification solution
+before pruning pressure begins.
+
+---
+## Results
 
 Results will vary by hardware and random seed. Typical outputs look like:
 
 | Lambda | Test Accuracy | Sparsity Level |
 |--------|:-------------:|:--------------:|
-| 1e-5   | ~52%          | ~12%           |
-| 1e-4   | ~50%          | ~45%           |
-| 1e-3   | ~44%          | ~88%           |
+| 1.0    | ~59%          | ~48%           |
+| 3.0    | ~60%          | ~72%           |
+| 10.0   | ~44%          | ~88%           |
 
 The gate distribution plot (`gate_distributions.png`) will show a characteristic **bimodal pattern** — a large spike near 0 (pruned weights) and a cluster of active gates away from 0:
 
@@ -126,40 +175,6 @@ Count
      0                               1
      ↑ pruned                  ↑ active
 ```
-
----
-
-## Architecture
-
-```
-Input (3×32×32)
-      │  flatten
-      ▼
-PrunableLinear(3072 → 512) + BN + ReLU + Dropout(0.2)
-      ▼
-PrunableLinear(512 → 256)  + BN + ReLU + Dropout(0.2)
-      ▼
-PrunableLinear(256 → 128)  + BN + ReLU + Dropout(0.2)
-      ▼
-PrunableLinear(128 → 10)
-      ▼
-Output (10 classes)
-```
-
----
-
-## Configuration
-
-All key hyperparameters are set as constants near the top of `self_pruning_nn.py`:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LAMBDAS` | `[1e-5, 1e-4, 1e-3]` | Sparsity penalty values to compare |
-| `EPOCHS` | `30` | Training epochs per experiment |
-| `SEED` | `42` | Global random seed |
-| `hidden_dims` | `(512, 256, 128)` | Hidden layer sizes |
-| `lr` | `1e-3` | Adam learning rate |
-| `batch_size` | `128` | Training batch size |
 
 ---
 
