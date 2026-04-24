@@ -161,7 +161,7 @@ Results will vary by hardware and random seed. Typical outputs look like:
 |--------|:-------------:|:--------------:|
 | 1.0    | ~59%          | ~48%           |
 | 3.0    | ~60%          | ~72%           |
-| 10.0   | ~44%          | ~88%           |
+| 10.0   | ~59%          | ~88%           |
 
 The gate distribution plot (`gate_distributions.png`) will show a characteristic **bimodal pattern** — a large spike near 0 (pruned weights) and a cluster of active gates away from 0:
 
